@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env
+.env
+venv/
+.env.*
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+
+# Uploads
+uploads/
+temp/
+
+# Logs
+*.log
