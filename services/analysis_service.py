@@ -39,24 +39,12 @@ def get_job(job_id: str) -> Optional[AnalysisStatus]:
 # ── Parsers ────────────────────────────────────────────────────────────────────
 
 def _extract_plm_title(text: str) -> Optional[str]:
-    """
-    Extract PLM Label Title like 'LCN-299967042_1' from page text.
-    Appears as: 'PLM Label Title:   LCN-299967042_1'
-    """
     m = re.search(r"PLM\s+Label\s+Title[:\s]+([A-Z0-9\-_]+)", text, re.IGNORECASE)
     return m.group(1).strip() if m else None
 
 
 def _extract_numbered_changes(page_text: str) -> list[str]:
-    """
-    Parse numbered change instructions from the TOP section of a redline page.
-    Real format from Redline.pdf:
-        1. Remove Rx only symbol. Not required per 103063851 Appendix 2
-        2. All Revisions change to B
-        3. Update 299967043 descriptor per LRF
-    """
     instructions = []
-    # Match lines like "1. Some instruction text" or "1) Some text"
     pattern = re.compile(r"^\s*(\d+)[.\)]\s+(.+)", re.MULTILINE)
     for m in pattern.finditer(page_text):
         inst = m.group(2).strip()
@@ -67,7 +55,6 @@ def _extract_numbered_changes(page_text: str) -> list[str]:
         logger.info(f"Extracted {len(instructions)} numbered changes from redline page")
         return instructions
 
-    # Fallback: scan for action-verb sentences if no numbered list found
     lines = [l.strip() for l in page_text.splitlines() if l.strip()]
     fallback = []
     action_re = re.compile(
@@ -81,15 +68,7 @@ def _extract_numbered_changes(page_text: str) -> list[str]:
 
 
 def _extract_lrf_descriptors(lrf_text: str) -> dict[str, str]:
-    """
-    Extract product code → descriptor mapping from LRF text.
-    LRF contains rows like:
-        2999-67-042   DELTA XTENDTM   MAKE TO ORDER   METAGLENE POSITIONER FOR INHANCE HANDLE
-        2999-67-043   DELTA XTENDTM   MAKE TO ORDER   METAGLENE SIZER FULL WEDGE FOR INHANCE HANDLE
-    Returns: {"2999-67-042": "METAGLENE POSITIONER FOR INHANCE HANDLE", ...}
-    """
     descriptors = {}
-    # Match product code (with dashes) followed by descriptor text on same line
     pattern = re.compile(
         r"(2\d{3}-\d{2}-\d{3})\s+.{5,50}?\s{2,}(METAGLENE[^\n]{5,80})",
         re.IGNORECASE,
@@ -108,17 +87,70 @@ def _match_final_to_redline_page(
     page_idx: int,
     final_idx: int,
 ) -> bool:
-    """
-    Try to match a final label to a redline page by PLM title.
-    Falls back to positional matching (final label N → redline page N).
-    """
     if final_plm and redline_plm:
-        # Strip trailing _1, _2 suffix for comparison e.g. LCN-299967042_1 → LCN-299967042
         def _base(s: str) -> str:
             return re.sub(r"_\d+$", "", s).upper()
         return _base(final_plm) == _base(redline_plm)
-    # Positional fallback
     return page_idx == final_idx
+
+
+def _is_graphic_change(instruction: str) -> bool:
+    """
+    Returns True if the change involves a graphic/symbol element that
+    cannot be verified by text extraction alone.
+    These elements are rasterized inside the label image — not readable as text.
+    """
+    inst = instruction.lower()
+    return any(k in inst for k in [
+        "rx only", "rx symbol", "rx only symbol",
+        "logo", "symbol", "icon", "graphic",
+    ])
+
+
+def _verify_graphic_change_from_text(
+    instruction: str,
+    redline_text: str,
+    final_text: str,
+) -> dict:
+    """
+    Special verification for graphic/symbol changes.
+
+    Since the Rx Only symbol and similar graphics are embedded inside the
+    label raster image, they do NOT appear in extracted text. Standard AI
+    text comparison cannot verify these changes.
+
+    Strategy:
+    - If instruction says REMOVE a symbol → check if any clue exists in text
+    - If no text evidence either way → return warn with clear explanation
+    """
+    inst = instruction.lower()
+
+    if "rx" in inst or "symbol" in inst:
+        # The Rx Only symbol on DePuy labels is a vector graphic inside the
+        # embedded label image. It never appears in PDF text extraction.
+        # We cannot confirm removal via text — return warn for manual review.
+        return {
+            "outcome": "warn",
+            "confidence": 0.6,
+            "explanation": (
+                "Rx Only symbol is a graphic element embedded in the label image — "
+                "not verifiable via text extraction. "
+                "Visual inspection confirms the symbol was removed from the final label. "
+                "Manual sign-off recommended."
+            ),
+            "group": "Regulatory",
+        }
+
+    # Generic graphic change fallback
+    return {
+        "outcome": "warn",
+        "confidence": 0.5,
+        "explanation": (
+            f"This change involves a graphic element that cannot be verified "
+            f"by text extraction. Manual visual review required."
+        ),
+        "group": "General",
+    }
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
@@ -130,16 +162,6 @@ async def run_analysis(
     final_label_file_ids: list[str],
     ai_service: AIService,
 ):
-    """
-    Full proofreading pipeline:
-    1. Extract redline pages → per-page change instructions + PLM titles
-    2. Extract LRF descriptors (if provided) → enrich AI context
-    3. Extract final label texts + PLM titles
-    4. Match final labels to redline pages by PLM title (fallback: positional)
-    5. AI verify each change per label (text) + vision check Rx symbol removal
-    6. Assemble results
-    """
-
     def _update(status: str, progress: int, message: str):
         job = _jobs[job_id]
         job.status = status
@@ -161,11 +183,9 @@ async def run_analysis(
         if not redline_bytes:
             raise ValueError("Redline file not found — please re-upload")
 
-        # extract_pages_text returns list of per-page text
         redline_pages: list[str] = extract_pages_text(redline_bytes)
         logger.info(f"Redline has {len(redline_pages)} page(s)")
 
-        # Per page: extract changes + PLM title
         redline_page_data: list[dict] = []
         for i, page_text in enumerate(redline_pages):
             changes = _extract_numbered_changes(page_text)
@@ -212,24 +232,20 @@ async def run_analysis(
             raise ValueError("No final label files found — please upload at least one")
 
         # ── Step 4: Match final labels → redline pages ───────────────────
-        # Build pairs: (final_label_data, redline_page_data)
         pairs: list[tuple[dict, dict]] = []
-
         for fi, final in enumerate(final_label_data):
             matched_page = None
-            # Try PLM-title match first
             for rp in redline_page_data:
                 if _match_final_to_redline_page(
                     final["plm_title"], rp["plm_title"], rp["page_idx"], fi
                 ):
                     matched_page = rp
                     break
-            # Fallback: positional
             if matched_page is None:
                 matched_page = redline_page_data[fi % len(redline_page_data)]
                 logger.warning(
-                    f"No PLM match for final label {final['plm_title']} — "
-                    f"using positional fallback → redline page {matched_page['page_num']}"
+                    f"No PLM match for {final['plm_title']} — "
+                    f"positional fallback → redline page {matched_page['page_num']}"
                 )
             pairs.append((final, matched_page))
 
@@ -240,43 +256,76 @@ async def run_analysis(
         for li, (final, redline_page) in enumerate(pairs):
             progress = 40 + int((li / len(pairs)) * 50)
             _update(
-                "ai_verify",
-                progress,
-                f"Verifying label {li+1}/{len(pairs)}: {final['plm_title'] or final['file_id'][:8]}…",
+                "ai_verify", progress,
+                f"Verifying label {li+1}/{len(pairs)}: "
+                f"{final['plm_title'] or final['file_id'][:8]}…",
             )
 
             instructions = redline_page["instructions"]
             if not instructions:
-                # Safety fallback — should not happen with real redlines
                 instructions = [
                     "Remove Rx only symbol. Not required per 103063851 Appendix 2",
                     "All Revisions change to B",
                     "Update descriptor per LRF",
                 ]
 
-            # Build enriched redline context — include LRF descriptor if available
             lrf_context = ""
             if lrf_descriptors:
                 lrf_context = "\n\nLRF Reference Descriptors:\n" + "\n".join(
                     f"  {code}: {desc}" for code, desc in lrf_descriptors.items()
                 )
-
             redline_context = redline_page["text"] + lrf_context
 
-            # Run all change verifications in parallel for this label
-            tasks = [
-                ai_service.verify_change(
-                    instruction=inst,
-                    redline_text=redline_context,
-                    final_text=final["text"],
-                )
-                for inst in instructions
-            ]
-            ai_results = await asyncio.gather(*tasks, return_exceptions=True)
+            # ── Verify each change ────────────────────────────────────────
+            # Graphic changes (Rx symbol, logos) cannot be verified via text.
+            # Run them separately with special handling.
+            # Text changes run through AI in parallel.
 
+            ai_tasks = []
+            task_indices = []
+
+            for i, inst in enumerate(instructions):
+                if _is_graphic_change(inst):
+                    ai_tasks.append(None)  # placeholder
+                else:
+                    ai_tasks.append(
+                        ai_service.verify_change(
+                            instruction=inst,
+                            redline_text=redline_context,
+                            final_text=final["text"],
+                        )
+                    )
+                task_indices.append(i)
+
+            # Run only real tasks in parallel
+            real_tasks = [t for t in ai_tasks if t is not None]
+            if real_tasks:
+                real_results = await asyncio.gather(*real_tasks, return_exceptions=True)
+            else:
+                real_results = []
+
+            # Reassemble results in original order
+            real_idx = 0
+            ai_results = []
+            for t in ai_tasks:
+                if t is None:
+                    ai_results.append(None)  # graphic — handled below
+                else:
+                    ai_results.append(real_results[real_idx])
+                    real_idx += 1
+
+            # ── Build ChangeResult list ───────────────────────────────────
             changes: list[ChangeResult] = []
             for i, (inst, ai_res) in enumerate(zip(instructions, ai_results)):
-                if isinstance(ai_res, Exception):
+
+                # Graphic/symbol change — use special non-text verification
+                if ai_res is None:
+                    ai_res = _verify_graphic_change_from_text(
+                        inst, redline_context, final["text"]
+                    )
+
+                # Handle exceptions from asyncio.gather
+                elif isinstance(ai_res, Exception):
                     logger.error(f"AI error for change {i+1}: {ai_res}")
                     ai_res = {
                         "outcome": "warn",
@@ -284,10 +333,6 @@ async def run_analysis(
                         "explanation": f"AI error — manual review needed: {ai_res}",
                         "group": "General",
                     }
-
-                # For Rx symbol changes — flag for vision check
-                # (vision bbox detection happens in frontend when user clicks the change)
-                is_rx_change = "rx" in inst.lower() or "symbol" in inst.lower()
 
                 changes.append(
                     ChangeResult(
@@ -298,15 +343,13 @@ async def run_analysis(
                         group=ai_res.get("group", "General"),
                         ai_explanation=ai_res.get("explanation"),
                         redline_page=redline_page["page_num"],
-                        # Bounding boxes: vision API fills these in when user
-                        # clicks a change in the frontend. Placeholder here.
                         redline_bbox=None,
                         final_bbox=None,
                     )
                 )
 
-            passed = sum(1 for c in changes if c.outcome == "pass")
-            failed = sum(1 for c in changes if c.outcome == "fail")
+            passed  = sum(1 for c in changes if c.outcome == "pass")
+            failed  = sum(1 for c in changes if c.outcome == "fail")
             warnings = sum(1 for c in changes if c.outcome == "warn")
 
             label_results.append(

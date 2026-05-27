@@ -1,7 +1,8 @@
 """
 PDF Service — text extraction per-page and full-doc.
 Uses pdfplumber for text-based PDFs.
-Uses PyMuPDF for rendering PDF pages as PNG images and text search.
+Uses PyMuPDF for rendering PDF pages as PNG images.
+Uses pytesseract OCR for pixel-perfect text location on any PDF type.
 """
 
 import io
@@ -75,8 +76,8 @@ def render_label_area_as_png(
 ) -> tuple[bytes, float, float, float, float]:
     """
     Renders the full page at 200 DPI.
-    Returns (png_bytes, 0.0, 0.0, 1.0, 1.0) — full page fractions.
-    Used as fallback when text search fails (for visual/symbol elements).
+    Returns (png_bytes, 0.0, 0.0, 1.0, 1.0).
+    Used as input for gpt-4o vision fallback.
     """
     try:
         png = render_page_as_png(file_bytes, page_num)
@@ -94,22 +95,8 @@ def find_text_bbox_on_page(
     search_from_bottom: float = 0.92,
 ) -> dict:
     """
-    Finds the EXACT pixel position of text on a PDF page using PyMuPDF.
-    Returns normalized bbox {top, left, width, height} (0.0–1.0).
-
-    Searches only within the label content zone (default 35%–92% of page height):
-      - Skips top 35%  → avoids the Redline annotation header
-                          (numbered change instructions in red at top of page)
-      - Skips bottom 8% → avoids the footer disclaimer text
-                           (Work Instruction ref, WI-0244, Rev AV, Page 1 of 1)
-
-    This ensures:
-      Change 1 — "Rx Only" finds the symbol on the label, not the header text
-      Change 2 — "REV. A" finds the revision field, not the footer "Rev AV"
-      Change 3 — "METAGLENE" finds the descriptor line in the label body
-
-    Works for any company's label — no hardcoded assumptions, just geometry.
-    Falls back to {"found": False} if nothing found in the content zone.
+    PyMuPDF text search — fast but only works on text-based PDFs.
+    Returns {"found": False} for vector/image PDFs like DePuy labels.
     """
     try:
         import fitz
@@ -120,40 +107,27 @@ def find_text_bbox_on_page(
         page_w = page.rect.width
         page_h = page.rect.height
 
-        # Content zone boundaries in page points
         zone_top    = page_h * search_from_top
         zone_bottom = page_h * search_from_bottom
 
         def in_zone(rects):
-            """Keep only matches inside the label content zone."""
             return [r for r in rects if r.y0 > zone_top and r.y1 < zone_bottom]
 
-        # ── Try 1: exact text match ────────────────────────────────────
         instances = in_zone(page.search_for(search_text, quads=False))
 
-        # ── Try 2: first 3 words ───────────────────────────────────────
         if not instances:
             short = " ".join(search_text.split()[:3])
             if short != search_text:
                 instances = in_zone(page.search_for(short, quads=False))
 
-        # ── Try 3: first 2 words ───────────────────────────────────────
         if not instances:
-            short2 = " ".join(search_text.split()[:2])
-            if short2 != search_text:
-                instances = in_zone(page.search_for(short2, quads=False))
-
-        if not instances:
-            print(f"[TEXT SEARCH] '{search_text}' not found in zone "
-                  f"{search_from_top:.0%}–{search_from_bottom:.0%}")
             return {"found": False, "bbox": None, "method": "text_search"}
 
-        # Use the first match — add small padding for visibility
         r = instances[0]
         pad_x = page_w * 0.005
         pad_y = page_h * 0.003
 
-        result = {
+        return {
             "found": True,
             "method": "text_search",
             "bbox": {
@@ -163,10 +137,108 @@ def find_text_bbox_on_page(
                 "height": min(1.0, (r.y1 - r.y0 + pad_y * 2) / page_h),
             },
         }
-        print(f"[TEXT SEARCH] ✅ '{search_text}' → top={result['bbox']['top']:.3f} "
-              f"left={result['bbox']['left']:.3f}")
-        return result
-
     except Exception as e:
-        logger.error(f"Text search failed for '{search_text}': {e}")
+        logger.error(f"Text search failed: {e}")
         return {"found": False, "bbox": None, "method": "text_search"}
+
+
+def ocr_find_text_bbox(
+    png_bytes: bytes,
+    search_terms: list[str],
+    page_height_fraction_min: float = 0.30,
+    page_height_fraction_max: float = 0.92,
+) -> dict:
+    """
+    OCR-based pixel-perfect text location.
+    Works on vector PDFs, image PDFs, scanned PDFs — any format.
+
+    Key insight from DePuy label debug:
+    - METAGLENE found at top%=0.554 — single word search works perfectly
+    - REV.B found at top%=0.640 on Final Label — no space between REV. and B
+    - REV on Redline has handwritten slash — not readable, vision handles it
+    - Rx Only is a graphic symbol — not readable, vision handles it
+    """
+    try:
+        import pytesseract
+        pytesseract.pytesseract.tesseract_cmd = \
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(png_bytes))
+        img_w, img_h = img.size
+
+        zone_min_px = img_h * page_height_fraction_min
+        zone_max_px = img_h * page_height_fraction_max
+
+        data = pytesseract.image_to_data(
+            img,
+            output_type=pytesseract.Output.DICT,
+            config="--psm 11"
+        )
+
+        n = len(data["text"])
+
+        for term in search_terms:
+            term_words = term.lower().split()
+            term_len   = len(term_words)
+
+            for i in range(n - term_len + 1):
+                window = [
+                    (data["text"][i + j] or "").lower().strip()
+                    for j in range(term_len)
+                ]
+
+                if window != term_words:
+                    continue
+
+                confidences = []
+                for j in range(term_len):
+                    c = str(data["conf"][i + j])
+                    if c.lstrip("-").isdigit():
+                        confidences.append(int(c))
+
+                if not confidences or max(confidences) < 40:
+                    continue
+
+                x0_px = min(data["left"][i + j]                          for j in range(term_len))
+                y0_px = min(data["top"][i + j]                           for j in range(term_len))
+                x1_px = max(data["left"][i + j] + data["width"][i + j]   for j in range(term_len))
+                y1_px = max(data["top"][i + j]  + data["height"][i + j]  for j in range(term_len))
+
+                if y0_px < zone_min_px or y1_px > zone_max_px:
+                    print(f"[OCR] '{term}' found at y={y0_px:.0f}px "
+                          f"(top={y0_px/img_h:.3f}) outside zone "
+                          f"({zone_min_px:.0f}–{zone_max_px:.0f}px) — skipping")
+                    continue
+
+                pad_x = img_w * 0.005
+                pad_y = img_h * 0.003
+
+                result = {
+                    "found": True,
+                    "method": "ocr",
+                    "bbox": {
+                        "top":    max(0.0, (y0_px - pad_y) / img_h),
+                        "left":   max(0.0, (x0_px - pad_x) / img_w),
+                        "width":  min(1.0, (x1_px - x0_px + pad_x * 2) / img_w),
+                        "height": min(1.0, (y1_px - y0_px + pad_y * 2) / img_h),
+                    }
+                }
+                print(f"[OCR] ✅ '{term}' → "
+                      f"top={result['bbox']['top']:.3f} "
+                      f"left={result['bbox']['left']:.3f} "
+                      f"w={result['bbox']['width']:.3f} "
+                      f"h={result['bbox']['height']:.3f}")
+                return result
+
+        print(f"[OCR] nothing found for: {search_terms}")
+        return {"found": False, "bbox": None, "method": "ocr"}
+
+    except ImportError:
+        logger.error(
+            "pytesseract not installed — run: pip install pytesseract pillow"
+        )
+        return {"found": False, "bbox": None, "method": "ocr"}
+    except Exception as e:
+        logger.error(f"OCR search failed: {e}")
+        return {"found": False, "bbox": None, "method": "ocr"}
